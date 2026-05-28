@@ -1,0 +1,602 @@
+import os
+import json
+import atexit
+import subprocess
+import re
+import logging
+from collections import defaultdict
+from waitress import serve
+from pathlib import Path
+from flask import Flask, jsonify, render_template, request, Response
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from threading import Event, Lock
+
+logging.basicConfig(level=logging.INFO)
+
+PROGRAM_PATH = Path(__file__).resolve().parent
+PROJECTS_FILE = Path(f"{PROGRAM_PATH}/projects.txt")
+
+RE_PEER = re.compile(r"\[(.*?)\]")
+RE_RESET_CN = re.compile(r"\s(\S+?)/")
+RE_VERIFY_CN = re.compile(r"CN=(\S+)")
+
+data_events = defaultdict(Event)
+watchers = {}
+WATCHER_LOCK = Lock()
+
+PROJECT_CACHE = {}
+CACHE_LOCK = Lock()
+
+PROJECT_MAP = []
+PROJECTS_LOCK = Lock()
+
+#----------------------------------------------------------------
+
+def load_projects():
+   tmp = []
+   with PROJECTS_FILE.open() as f:
+      for line in f:
+         line = line.strip()
+         if not line or line.startswith("#"):
+            continue
+         start_ip, project = line.split(";", 1)
+         tmp.append((start_ip, project))
+
+   tmp.sort(key=lambda x: len(x[0]), reverse=True)
+
+   with PROJECTS_LOCK:
+      PROJECT_MAP.clear()
+      PROJECT_MAP.extend(tmp)
+
+#----------------------------------------------------------------
+
+def get_project(ip):
+   with PROJECTS_LOCK:
+      for start_ip, project in PROJECT_MAP:
+         if ip.startswith(start_ip):
+            return project
+   raise ValueError("PROJECT variable is not set!")
+
+#----------------------------------------------------------------
+
+def get_project_cache(project):
+   with CACHE_LOCK:
+      return PROJECT_CACHE.setdefault(project, {
+         "cn_order": [],
+         "cn_list": {},
+         "active_clients": {},
+         "client_activity": {},
+         "connection_state": {},
+         "last_log_pos": 0,
+         "last_seen_dirty": True,
+
+         "client_ip_map": {},
+         "ip_to_cn": {},
+         "client_ip_dirty": True,
+
+         "cn_file_dirty": True,
+
+         "permissions": {},
+         "permissions_dirty": True,
+      })
+
+#----------------------------------------------------------------
+
+def load_permissions(project):
+   cache = get_project_cache(project)
+   PERM = Path(f"/etc/openvpn/{project}/auth/auth-files/permissions.txt")
+   perm_map = {}
+
+   if not PERM.is_file():
+      cache["permissions"] = {}
+      cache["permissions_dirty"] = False
+      return
+
+   with PERM.open() as f:
+      for line in f:
+         if not line or line.startswith("#"):
+            continue
+         p = line.strip().split(";", 6)
+         if len(p) < 6:
+            continue
+
+         cn = p[0]
+         perm_map[cn] = (
+            p[2] == "1",
+            p[3] == "1",
+            p[4] == "1",
+            p[5] == "1",
+         )
+
+   print(perm_map)
+
+   cache["permissions"] = perm_map
+   cache["permissions_dirty"] = False
+
+#----------------------------------------------------------------
+
+def check_permissions(ip):
+   PROJECT = get_project(ip)
+   project_parts = PROJECT.split("-", 1)[0]
+   cache = get_project_cache(PROJECT)
+
+   if cache["permissions_dirty"]:
+      load_permissions(PROJECT)
+
+   if cache["client_ip_dirty"]:
+      load_CLIENT_CONF(PROJECT)
+
+   if cache["cn_file_dirty"]:
+      load_CN_LIST(PROJECT)
+
+   cn = cache["ip_to_cn"].get(ip)
+
+   if cn is None:
+      return project_parts, None, None, None, None
+
+   perms = cache["permissions"].get(cn)
+   if not perms:
+      return project_parts, None, None, None, None
+
+   return (project_parts, *perms)
+
+#----------------------------------------------------------------
+
+def block_key(requested_keys, ip):
+
+   PROJECT = get_project(ip)
+   CN_LIST = Path(f"/etc/openvpn/{PROJECT}/auth/auth-files/allowed-cn.txt")
+
+   if not CN_LIST.is_file():
+      raise FileNotFoundError(f"File {CN_LIST} not found")
+
+   lines = []
+   _, _, admin_b_status, _, _ = check_permissions(ip)
+
+   if not admin_b_status:
+      print("You do not have permission to use BLOCK button!")
+      return
+
+   with CN_LIST.open() as f:
+      for line in f:
+         line = line.strip()
+         if not line:
+            lines.append("\n")
+            continue
+         parts = line.split(";", 2)
+         if len(parts) == 3:
+            flag, key, _ = parts
+            if key in requested_keys:
+               if flag == "B":
+                  flag = "U"
+               else:
+                  flag = "B"
+
+            lines.append(f"{flag};{key};{_}\n")
+
+   with CN_LIST.open("w") as f:
+      f.writelines(lines)
+
+#----------------------------------------------------------------
+
+def restart(ip):
+
+   PROJECT = get_project(ip)
+
+   _, admin_r_status, _, _, _ = check_permissions(ip)
+
+   if not admin_r_status:
+      print("You do not have permision to use RESET button!")
+      return
+
+   subprocess.run(["systemctl", "restart", f"openvpn@{PROJECT}"], check=True)
+
+#----------------------------------------------------------------
+
+def load_CLIENT_CONF(project):
+   cache = get_project_cache(project)
+   IP_INFO = Path(f"/etc/openvpn/{project}/clients-conf")
+
+   cn_to_ip = {}
+   ip_to_cn = {}
+
+   if not IP_INFO.is_dir():
+      cache["client_ip_map"] = {}
+      cache["ip_to_cn"] = {}
+      cache["client_ip_dirty"] = False
+      return
+
+   for path in IP_INFO.iterdir():
+      if not path.is_file():
+         continue
+
+      with path.open() as f:
+         for line in f:
+            if line.startswith("ifconfig-push"):
+               vpn_ip = line.split()[1]
+               cn = path.name
+
+               cn_to_ip[cn] = vpn_ip
+               ip_to_cn[vpn_ip] = cn
+               break
+
+   cache["client_ip_map"] = cn_to_ip
+   cache["ip_to_cn"] = ip_to_cn
+   cache["client_ip_dirty"] = False
+
+#----------------------------------------------------------------
+
+def load_CN_LIST(project):
+   cache = get_project_cache(project)
+   CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
+   cn_map = {}
+   cn_order = []
+
+   with CN_LIST.open() as f:
+      for line in f:
+         line = line.strip()
+         if line.startswith("#"):
+            continue
+         if not line:
+            cn_order.append(None)
+            continue
+         flag, key, value = line.strip().split(";", 2)
+         cn_map[key] = (value, flag)
+         cn_order.append(key)
+
+   cache["cn_list"] = cn_map
+   cache["cn_order"] = cn_order
+   cache["cn_file_dirty"] = False
+
+#----------------------------------------------------------------
+
+def read_CN_LIST(ip):
+
+   PROJECT = get_project(ip)
+   cache = get_project_cache(PROJECT)
+
+   if cache["client_ip_dirty"]:
+      load_CLIENT_CONF(PROJECT)
+
+   if cache["cn_file_dirty"]:
+      load_CN_LIST(PROJECT)
+
+   existing_clients = {}
+
+   for key, (value, flag) in cache["cn_list"].items():
+      vpn_ip = cache["client_ip_map"].get(key)
+      existing_clients[key] = (value, vpn_ip, flag)
+
+   return existing_clients
+
+#----------------------------------------------------------------
+
+def read_LAST_SEEN(ip):
+
+   PROJECT = get_project(ip)
+   LOG = Path(f"/var/log/openvpn/full-logs/full-{PROJECT}.log")
+   cache = get_project_cache(PROJECT)
+
+   if not cache.get("last_seen_dirty", True):
+      return cache["client_activity"]
+
+   cache.setdefault("last_log_pos", 0)
+   cache.setdefault("client_activity", {})
+   cache.setdefault("connection_state", {})
+
+   if LOG.stat().st_size < cache["last_log_pos"]:
+      cache["last_log_pos"] = 0
+
+   with LOG.open() as f:
+      f.seek(cache["last_log_pos"])
+
+      for line in f:
+         line = line.strip()
+
+         if "Peer Connection Initiated" in line:
+            m = RE_PEER.search(line)
+            if m:
+               cn = m.group(1)
+
+               set_default_to_client_activity(cache, cn)
+
+               cache["connection_state"][cn] = {
+                  "verify_recorded": False
+               }
+
+         elif "SIGUSR1" in line:
+            m = RE_RESET_CN.search(line)
+            if m:
+               cn = m.group(1)
+
+               set_default_to_client_activity(cache, cn)
+
+               cache["client_activity"][cn]["last_seen"] = line[:19]
+
+               state = cache["connection_state"].setdefault(cn, {})
+               state["verify_recorded"] = False
+
+         elif "VERIFY SCRIPT ERROR" in line:
+            m = RE_VERIFY_CN.search(line)
+            if m:
+               cn = m.group(1)
+
+               set_default_to_client_activity(cache, cn)
+
+               state = cache["connection_state"].setdefault(cn, {
+                  "verify_recorded": False
+               })
+
+               if not state["verify_recorded"]:
+                  cache["client_activity"][cn]["is_blocked"] = True
+                  cache["client_activity"][cn]["last_seen"] = line[:19]
+                  state["verify_recorded"] = True
+
+      cache["last_log_pos"] = f.tell()
+
+   cache["last_seen_dirty"] = False
+
+   return cache["client_activity"]
+
+#----------------------------------------------------------------
+
+def set_default_to_client_activity(cache, cn):
+   cache["client_activity"].setdefault(cn, {
+      "last_seen": "Never",
+      "is_blocked": False
+   })
+
+#----------------------------------------------------------------
+
+def read_OPENVPN_STATUS(ip):
+
+   PROJECT = get_project(ip)
+   STATUS = Path(f"/var/log/openvpn/current-logs/current-status-{PROJECT}.log")
+
+   if not STATUS.is_file():
+      raise FileNotFoundError(f"File {STATUS} not found")
+
+   in_clients = False
+   active_clients = {}
+
+   with STATUS.open() as f:
+      for line in f:
+         line = line.strip()
+
+         if line.startswith("Common Name"):
+            in_clients = True
+            continue
+         if line.startswith("Virtual Address"):
+            in_clients = False
+            continue
+
+         if in_clients and line:
+            parts = line.split(",")
+            if len(parts) >= 5:
+               active_clients[parts[0]] = {
+                  "real_ip": parts[1].split(":")[0],
+                  "mb_received": round(int(parts[2]) / 1_000_000, 2),
+                  "mb_sent": round(int(parts[3]) / 1_000_000, 2),
+                  "connected_since": parts[4]
+               }
+
+   return active_clients
+
+#----------------------------------------------------------------
+
+def show_status(ip):
+
+   PROJECT = get_project(ip)
+   cache = get_project_cache(PROJECT)
+
+   read_CN_LIST(ip)
+
+   cache["active_clients"] = read_OPENVPN_STATUS(ip)
+
+   client_activity = read_LAST_SEEN(ip)
+   perms = check_permissions(ip)
+   skip_empty = True
+
+   rows = []
+
+   for item in cache["cn_order"]:
+      if item is None:
+         if skip_empty:
+            continue
+         rows.append({"empty": True})
+         continue
+      key = item
+      value, flag = cache["cn_list"][key]
+      vpn_ip = cache["client_ip_map"].get(key)
+      if value.startswith("Newag_OpenVPN") and not perms[3]:
+         continue
+      if value.startswith(perms[0]) and not perms[4]:
+         continue
+      skip_empty = False
+      if key in cache["active_clients"]:
+         a = cache["active_clients"][key]
+
+         rows.append({
+            "name": value,
+            "key": key,
+            "vpn_ip": vpn_ip,
+            "real_ip": a["real_ip"],
+            "mb_received": a["mb_received"],
+            "mb_sent": a["mb_sent"],
+            "connected_since": a["connected_since"],
+            "last_seen": "",
+            "is_blocked": flag == "B",
+         })
+      else:
+         rows.append({
+            "name": value,
+            "key": key,
+            "vpn_ip": vpn_ip,
+            "real_ip": "",
+            "mb_received": "",
+            "mb_sent": "",
+            "connected_since": "",
+            "last_seen": client_activity.get(key, {}).get("last_seen", "Never"),
+            "is_blocked": flag == "B",
+         })
+
+   return rows, perms
+
+#----------------------------------------------------------------
+
+class ProjectsFileHandler(FileSystemEventHandler):
+   def on_modified(self, event):
+      if event.src_path == str(PROJECTS_FILE):
+         load_projects()
+
+def start_projects_watcher():
+   observer = Observer()
+   observer.schedule(
+      ProjectsFileHandler(),
+      PROJECTS_FILE.parent,
+      recursive=False
+   )
+   observer.start()
+   return observer
+
+class FileChangeHandler(FileSystemEventHandler):
+   def __init__(self, project):
+      self.project = project
+
+   def on_modified(self, event):
+      if event.is_directory:
+         return
+
+      path = event.src_path
+      cache = get_project_cache(self.project)
+
+      if "clients-conf" in path:
+         cache["client_ip_dirty"] = True
+         data_events[self.project].set()
+         return
+
+      if "allowed-cn.txt" in path:
+         cache["cn_file_dirty"] = True
+         data_events[self.project].set()
+         return
+
+      if "current-status-" in path:
+         data_events[self.project].set()
+         return
+
+      if "full-logs" in path:
+         cache["last_seen_dirty"] = True
+         data_events[self.project].set()
+
+      if "permissions.txt" in path:
+         cache["permissions_dirty"] = True
+         data_events[self.project].set()
+         return
+
+   def on_created(self, event):
+      self.on_modified(event)
+
+   def on_deleted(self, event):
+      self.on_modified(event)
+
+def start_watcher_for_project(project):
+   with WATCHER_LOCK:
+      if project in watchers:
+         return
+
+      handler = FileChangeHandler(project)
+      observer = Observer()
+
+      CLIENTS_CONF = Path(f"/etc/openvpn/{project}/clients-conf")
+
+      CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
+      if not CN_LIST.is_file():
+         raise FileNotFoundError(f"File {CN_LIST} not found")
+
+      OPENVPN_STATUS = Path(f"/var/log/openvpn/current-logs/current-status-{project}.log")
+      if not OPENVPN_STATUS.is_file():
+         raise FileNotFoundError(f"File {OPENVPN_STATUS} not found")
+
+      FULL_LOGS = Path(f"/var/log/openvpn/full-logs/full-{project}.log")
+      if not FULL_LOGS.is_file():
+         raise FileNotFoundError(f"File {FULL_LOGS} not found")
+
+      PERM = Path(f"/etc/openvpn/{project}/auth/auth-files/permissions.txt")
+
+      observer.schedule(handler, CN_LIST.parent, recursive=False)
+      observer.schedule(handler, OPENVPN_STATUS.parent, recursive=False)
+      observer.schedule(handler, CLIENTS_CONF, recursive=False)
+      observer.schedule(handler, FULL_LOGS, recursive=False)
+      observer.schedule(handler, PERM, recursive=False)
+
+      observer.start()
+      watchers[project] = observer
+
+#----------------------------------------------------------------
+
+app = Flask(__name__)
+
+@app.before_request
+def log_request():
+   logging.info(
+      f"IP={request.remote_addr} "
+   )
+
+@app.before_request
+def ensure_watcher():
+   project = get_project(request.remote_addr)
+   start_watcher_for_project(project)
+
+@app.route("/", methods=["GET"])
+def index():
+    return render_template("index.html")
+
+@app.route("/block", methods=["POST"])
+def block():
+    block_key(request.get_json()["keys"], request.remote_addr)
+    data_events[get_project(request.remote_addr)].set()
+    return "", 204
+
+@app.route("/restart", methods=["POST"])
+def restart_openvpn():
+   restart(request.remote_addr)
+   return "", 204
+
+@app.route("/events", methods=["GET"])
+def events():
+
+    ip = request.remote_addr
+    project = get_project(ip)
+    event = data_events[project]
+
+    def stream():
+        while True:
+            event.wait()
+            event.clear()
+            rows, cn_permissions = show_status(ip)
+            yield f"data: {json.dumps({'rows': rows, 'cn_permissions': cn_permissions})}\n\n"
+
+    return Response(stream(), mimetype="text/event-stream")
+
+@app.route("/data", methods=["GET"])
+def data():
+   rows, perms = show_status(request.remote_addr)
+   return jsonify({
+      "rows": rows,
+      "cn_permissions": perms
+   })
+
+@atexit.register
+def stop_watchers():
+   if 'projects_observer' in globals():
+      projects_observer.stop()
+      projects_observer.join()
+   for observer in watchers.values():
+      observer.stop()
+      observer.join()
+
+if __name__ == "__main__":
+   load_projects()
+   projects_observer = start_projects_watcher()
+   serve(app, host="0.0.0.0", port=58080, threads=24)

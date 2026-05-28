@@ -1,0 +1,14 @@
+10.110.;pr-wlkp-newag-50110
+10.111.;lka-newag-50111
+10.100.;diag-newag-50100
+10.130.;e6-diag-newag-50130
+10.160.;dragon-newag-50160
+10.119.;lubelskie-newag-50119
+10.131.;mlp-newag-50131
+10.213.;pom-newag-50213
+10.132.;kd-newag-50132
+10.120.;service-newag-50120
+10.155.;service-newag-50155
+10.150.;service-newag-50150
+10.107.;op-newag-50107
+172.21.;pkpic-ezt-newag-50021
