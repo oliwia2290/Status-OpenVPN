@@ -11,6 +11,7 @@ from flask import Flask, jsonify, render_template, request, Response
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from threading import Event, Lock
+from pprint import pprint
 
 logging.basicConfig(level=logging.INFO)
 
@@ -68,16 +69,14 @@ def get_project_cache(project):
          "active_clients": {},
          "client_activity": {},
          "connection_state": {},
-         "last_log_pos": 0,
-         "last_seen_dirty": True,
-
          "client_ip_map": {},
          "ip_to_cn": {},
-         "client_ip_dirty": True,
-
-         "cn_file_dirty": True,
-
          "permissions": {},
+         "is_degraded": {},
+         "last_log_pos": 0,
+         "last_seen_dirty": True,
+         "client_ip_dirty": True,
+         "cn_file_dirty": True,
          "permissions_dirty": True,
       })
 
@@ -98,7 +97,7 @@ def load_permissions(project):
          if not line or line.startswith("#"):
             continue
          p = line.strip().split(";", 6)
-         if len(p) < 6:
+         if len(p) < 7:
             continue
 
          cn = p[0]
@@ -107,9 +106,8 @@ def load_permissions(project):
             p[3] == "1",
             p[4] == "1",
             p[5] == "1",
+            p[6] == "1",
          )
-
-   print(perm_map)
 
    cache["permissions"] = perm_map
    cache["permissions_dirty"] = False
@@ -118,6 +116,7 @@ def load_permissions(project):
 
 def check_permissions(ip):
    PROJECT = get_project(ip)
+   project_ip = ip.split(".", 4)[1]
    project_parts = PROJECT.split("-", 1)[0]
    cache = get_project_cache(PROJECT)
 
@@ -133,13 +132,13 @@ def check_permissions(ip):
    cn = cache["ip_to_cn"].get(ip)
 
    if cn is None:
-      return project_parts, None, None, None, None
+      return project_parts, project_ip, None, None, None, None, None
 
    perms = cache["permissions"].get(cn)
    if not perms:
-      return project_parts, None, None, None, None
+      return project_parts, project_ip, None, None, None, None, None
 
-   return (project_parts, *perms)
+   return (project_parts, project_ip, perms)
 
 #----------------------------------------------------------------
 
@@ -152,9 +151,9 @@ def block_key(requested_keys, ip):
       raise FileNotFoundError(f"File {CN_LIST} not found")
 
    lines = []
-   _, _, admin_b_status, _, _ = check_permissions(ip)
+   _, _, perms = check_permissions(ip)
 
-   if not admin_b_status:
+   if not perms[1]:
       print("You do not have permission to use BLOCK button!")
       return
 
@@ -184,9 +183,9 @@ def restart(ip):
 
    PROJECT = get_project(ip)
 
-   _, admin_r_status, _, _, _ = check_permissions(ip)
+   _, _, perms = check_permissions(ip)
 
-   if not admin_r_status:
+   if not perms[0]:
       print("You do not have permision to use RESET button!")
       return
 
@@ -279,7 +278,7 @@ def read_LAST_SEEN(ip):
    cache = get_project_cache(PROJECT)
 
    if not cache.get("last_seen_dirty", True):
-      return cache["client_activity"]
+      return cache["client_activity"], cache["connection_state"]
 
    cache.setdefault("last_log_pos", 0)
    cache.setdefault("client_activity", {})
@@ -299,10 +298,9 @@ def read_LAST_SEEN(ip):
             if m:
                cn = m.group(1)
 
-               set_default_to_client_activity(cache, cn)
-
                cache["connection_state"][cn] = {
-                  "verify_recorded": False
+                  "verify_recorded": False,
+                  "is_degraded": False
                }
 
          elif "SIGUSR1" in line:
@@ -310,12 +308,15 @@ def read_LAST_SEEN(ip):
             if m:
                cn = m.group(1)
 
-               set_default_to_client_activity(cache, cn)
+               cache["client_activity"][cn] = {
+                  "last_seen": line[:19],
+                  "is_blocked": False
+               }
 
-               cache["client_activity"][cn]["last_seen"] = line[:19]
-
-               state = cache["connection_state"].setdefault(cn, {})
-               state["verify_recorded"] = False
+               cache["connection_state"][cn] = {
+                  "verify_recorded": False,
+                  "is_degraded": False
+               }
 
          elif "VERIFY SCRIPT ERROR" in line:
             m = RE_VERIFY_CN.search(line)
@@ -323,28 +324,54 @@ def read_LAST_SEEN(ip):
                cn = m.group(1)
 
                set_default_to_client_activity(cache, cn)
+               set_default_to_connection_state(cache, cn)
 
-               state = cache["connection_state"].setdefault(cn, {
-                  "verify_recorded": False
-               })
-
-               if not state["verify_recorded"]:
+               if not cache["connection_state"][cn]["verify_recorded"]:
                   cache["client_activity"][cn]["is_blocked"] = True
                   cache["client_activity"][cn]["last_seen"] = line[:19]
-                  state["verify_recorded"] = True
+                  cache["connection_state"][cn]["verify_recorded"] = True
+
+         elif "VERIFY OK" in line:
+            m = RE_RESET_CN.search(line)
+            if m:
+               cn = m.group(1)
+
+               set_default_to_connection_state(cache, cn)
+               set_default_to_client_activity(cache, cn)
+
+               cache["connection_state"][cn] = {
+                  "verify_recorded": False,
+                  "is_degraded": False
+               }
+
+         elif "MULTI: packet dropped due to output saturation" in line:
+            m = RE_RESET_CN.search(line)
+            if m:
+               cn = m.group(1)
+
+               set_default_to_connection_state(cache, cn)
+
+               if not cache["connection_state"][cn]["is_degraded"]:
+                  cache["connection_state"][cn]["is_degraded"] = True
 
       cache["last_log_pos"] = f.tell()
 
    cache["last_seen_dirty"] = False
 
-   return cache["client_activity"]
+   return cache["client_activity"], cache["connection_state"]
 
 #----------------------------------------------------------------
 
 def set_default_to_client_activity(cache, cn):
    cache["client_activity"].setdefault(cn, {
       "last_seen": "Never",
-      "is_blocked": False
+      "is_blocked": False,
+   })
+
+def set_default_to_connection_state(cache, cn):
+   cache["connection_state"].setdefault(cn, {
+      "verify_recorded": False,
+      "is_degraded": False
    })
 
 #----------------------------------------------------------------
@@ -385,6 +412,19 @@ def read_OPENVPN_STATUS(ip):
 
 #----------------------------------------------------------------
 
+def permission_filter(value, perms, project_parts, project_ip, client_activity, cn):
+   if value.startswith("Newag_OpenVPN") and not perms[2]:
+      return False
+   if value.startswith(project_parts) and project_ip in value and not perms[3]:
+      return False
+   if (value[-1].isdigit() and value.startswith(project_parts) and not perms[4]) or (not value.startswith(project_parts) and not value.startswith("Newag_OpenVPN") and not perms[4]):
+      return False
+   if value.startswith(project_parts) and not client_activity.get(cn, {}).get("last_seen", False):
+      return False
+   return True
+
+#----------------------------------------------------------------
+
 def show_status(ip):
 
    PROJECT = get_project(ip)
@@ -393,51 +433,48 @@ def show_status(ip):
    read_CN_LIST(ip)
 
    cache["active_clients"] = read_OPENVPN_STATUS(ip)
+   client_activity, connection_state = read_LAST_SEEN(ip)
+   project_parts, project_ip, perms = check_permissions(ip)
 
-   client_activity = read_LAST_SEEN(ip)
-   perms = check_permissions(ip)
    skip_empty = True
-
    rows = []
 
-   for item in cache["cn_order"]:
-      if item is None:
+   for cn in cache["cn_order"]:
+      if cn is None:
          if skip_empty:
+            rows.append({"empty": True})
+            skip_empty = False
             continue
-         rows.append({"empty": True})
          continue
-      key = item
-      value, flag = cache["cn_list"][key]
-      vpn_ip = cache["client_ip_map"].get(key)
-      if value.startswith("Newag_OpenVPN") and not perms[3]:
+      value, flag = cache["cn_list"][cn]
+      permission_filter_result = permission_filter(value, perms, project_parts, project_ip, client_activity, cn)
+      if not permission_filter_result:
          continue
-      if value.startswith(perms[0]) and not perms[4]:
-         continue
-      skip_empty = False
-      if key in cache["active_clients"]:
-         a = cache["active_clients"][key]
+      skip_empty = True
+      if cn in cache["active_clients"]:
 
          rows.append({
             "name": value,
-            "key": key,
-            "vpn_ip": vpn_ip,
-            "real_ip": a["real_ip"],
-            "mb_received": a["mb_received"],
-            "mb_sent": a["mb_sent"],
-            "connected_since": a["connected_since"],
+            "key": cn,
+            "vpn_ip": cache["client_ip_map"][cn],
+            "real_ip": cache["active_clients"][cn]["real_ip"],
+            "mb_received": cache["active_clients"][cn]["mb_received"],
+            "mb_sent": cache["active_clients"][cn]["mb_sent"],
+            "connected_since": cache["active_clients"][cn]["connected_since"],
             "last_seen": "",
             "is_blocked": flag == "B",
+            "is_degraded": cache["connection_state"][cn]["is_degraded"],
          })
       else:
          rows.append({
             "name": value,
-            "key": key,
-            "vpn_ip": vpn_ip,
+            "key": cn,
+            "vpn_ip": cache["client_ip_map"][cn],
             "real_ip": "",
             "mb_received": "",
             "mb_sent": "",
             "connected_since": "",
-            "last_seen": client_activity.get(key, {}).get("last_seen", "Never"),
+            "last_seen": client_activity.get(cn, {}).get("last_seen", "Never"),
             "is_blocked": flag == "B",
          })
 
@@ -476,7 +513,7 @@ class FileChangeHandler(FileSystemEventHandler):
          data_events[self.project].set()
          return
 
-      if "allowed-cn.txt" in path:
+      if "allowed-cn" in path:
          cache["cn_file_dirty"] = True
          data_events[self.project].set()
          return
@@ -489,7 +526,7 @@ class FileChangeHandler(FileSystemEventHandler):
          cache["last_seen_dirty"] = True
          data_events[self.project].set()
 
-      if "permissions.txt" in path:
+      if "permissions" in path:
          cache["permissions_dirty"] = True
          data_events[self.project].set()
          return
@@ -523,6 +560,8 @@ def start_watcher_for_project(project):
          raise FileNotFoundError(f"File {FULL_LOGS} not found")
 
       PERM = Path(f"/etc/openvpn/{project}/auth/auth-files/permissions.txt")
+      if not PERM.is_file():
+         raise FileNotFoundError(f"File {PERM} not found")
 
       observer.schedule(handler, CN_LIST.parent, recursive=False)
       observer.schedule(handler, OPENVPN_STATUS.parent, recursive=False)
@@ -541,6 +580,7 @@ app = Flask(__name__)
 def log_request():
    logging.info(
       f"IP={request.remote_addr} "
+      f"Request IP={request.url} "
    )
 
 @app.before_request
@@ -599,4 +639,4 @@ def stop_watchers():
 if __name__ == "__main__":
    load_projects()
    projects_observer = start_projects_watcher()
-   serve(app, host="0.0.0.0", port=58080, threads=24)
+   serve(app, host="0.0.0.0", port=58081, threads=24)
