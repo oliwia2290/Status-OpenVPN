@@ -415,11 +415,11 @@ def read_OPENVPN_STATUS(ip):
 def permission_filter(value, perms, project_parts, project_ip, client_activity, cn):
    if value.startswith("Newag_OpenVPN") and not perms[2]:
       return False
-   if value.startswith(project_parts) and project_ip in value and not perms[3]:
+   if not value[-1].isdigit() and value.startswith(project_parts) and project_ip in value and not perms[3]:
       return False
    if (value[-1].isdigit() and value.startswith(project_parts) and not perms[4]) or (not value.startswith(project_parts) and not value.startswith("Newag_OpenVPN") and not perms[4]):
       return False
-   if value.startswith(project_parts) and not client_activity.get(cn, {}).get("last_seen", False):
+   if value[-1].isdigit() and value.startswith(project_parts) and not client_activity.get(cn, {}).get("last_seen", False):
       return False
    return True
 
@@ -639,4 +639,4 @@ def stop_watchers():
 if __name__ == "__main__":
    load_projects()
    projects_observer = start_projects_watcher()
-   serve(app, host="0.0.0.0", port=58081, threads=24)
+   serve(app, host="0.0.0.0", port=58080, threads=24)
