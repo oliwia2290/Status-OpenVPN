@@ -47,6 +47,7 @@ evt.onmessage = ({ data }) => {
       <td>${r.mb_sent}</td>
       <td>${r.connected_since}</td>
       <td>${r.last_seen}</td>
+      <td>${r.cn_end_date}</td>
       <td class='status-color'>${r.is_blocked ? (r.real_ip ? 'RESTART INSTANCE TO BLOCK NOW' : 'BLOCKED') : ''}</td>
     </tr>`;
   }).join("");

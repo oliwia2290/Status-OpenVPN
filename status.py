@@ -12,6 +12,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from threading import Event, Lock
 from pprint import pprint
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 
@@ -73,11 +74,13 @@ def get_project_cache(project):
          "ip_to_cn": {},
          "permissions": {},
          "is_degraded": {},
+         "cn_end_date": {},
          "last_log_pos": 0,
          "last_seen_dirty": True,
          "client_ip_dirty": True,
          "cn_file_dirty": True,
          "permissions_dirty": True,
+         "cn_end_date_dirty": True,
       })
 
 #----------------------------------------------------------------
@@ -190,6 +193,31 @@ def restart(ip):
       return
 
    subprocess.run(["systemctl", "restart", f"openvpn@{PROJECT}"], check=True)
+
+#----------------------------------------------------------------
+
+def load_CN_END_DATE(project):
+   cache = get_project_cache(project)
+   certs_path = Path(f"/etc/openvpn/{project}/easy-rsa/pki/issued")
+
+   cn_end_date = {}
+
+   if not certs_path.is_dir():
+      cache["cn_end_date"] = {}
+      cache["cn_end_date_dirty"] = False
+      return
+
+   for path in certs_path.iterdir():
+      if not path.is_file():
+         continue
+      cn_date = subprocess.run(["openssl","x509","-enddate","-noout","-in",f"{path}"],check=True, text=True, capture_output=True)
+      cn_date_split = cn_date.stdout.split("=", 1)[1].strip()
+      cn_date_object = datetime.strptime(cn_date_split, "%b %d %H:%M:%S %Y %Z")
+      cn_date_str = cn_date_object.strftime("%d.%m.%Y")
+      cn_end_date[path.stem] = cn_date_str
+
+   cache["cn_end_date"] = cn_end_date
+   cache["cn_end_date_dirty"] = False
 
 #----------------------------------------------------------------
 
@@ -431,6 +459,7 @@ def show_status(ip):
    cache = get_project_cache(PROJECT)
 
    read_CN_LIST(ip)
+   load_CN_END_DATE(PROJECT)
 
    cache["active_clients"] = read_OPENVPN_STATUS(ip)
    client_activity, connection_state = read_LAST_SEEN(ip)
@@ -464,6 +493,7 @@ def show_status(ip):
             "last_seen": "",
             "is_blocked": flag == "B",
             "is_degraded": cache["connection_state"][cn]["is_degraded"],
+            "cn_end_date": cache["cn_end_date"][cn],
          })
       else:
          rows.append({
@@ -476,6 +506,7 @@ def show_status(ip):
             "connected_since": "",
             "last_seen": client_activity.get(cn, {}).get("last_seen", "Never"),
             "is_blocked": flag == "B",
+            "cn_end_date": cache["cn_end_date"][cn],
          })
 
    return rows, perms
@@ -639,4 +670,4 @@ def stop_watchers():
 if __name__ == "__main__":
    load_projects()
    projects_observer = start_projects_watcher()
-   serve(app, host="0.0.0.0", port=58080, threads=24)
+   serve(app, host="0.0.0.0", port=58081, threads=24)
