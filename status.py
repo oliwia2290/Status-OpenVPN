@@ -70,14 +70,14 @@ def get_project_cache(project):
          "active_clients": {},
          "client_activity": {},
          "connection_state": {},
-         "client_ip_map": {},
+         "cn_to_ip": {},
          "ip_to_cn": {},
          "permissions": {},
          "is_degraded": {},
          "cn_end_date": {},
          "last_log_pos": 0,
          "last_seen_dirty": True,
-         "client_ip_dirty": True,
+         "ip_dirty": True,
          "cn_file_dirty": True,
          "permissions_dirty": True,
          "cn_end_date_dirty": True,
@@ -126,7 +126,7 @@ def check_permissions(ip):
    if cache["permissions_dirty"]:
       load_permissions(PROJECT)
 
-   if cache["client_ip_dirty"]:
+   if cache["ip_dirty"]:
       load_CLIENT_CONF(PROJECT)
 
    if cache["cn_file_dirty"]:
@@ -223,41 +223,40 @@ def load_CN_END_DATE(project):
 
 def load_CLIENT_CONF(project):
    cache = get_project_cache(project)
-   IP_INFO = Path(f"/etc/openvpn/{project}/clients-conf")
+   clients_conf = Path(f"/etc/openvpn/{project}/clients-conf")
 
    cn_to_ip = {}
    ip_to_cn = {}
 
-   if not IP_INFO.is_dir():
-      cache["client_ip_map"] = {}
+   if not clients_conf.is_dir():
+      cache["cn_to_ip"] = {}
       cache["ip_to_cn"] = {}
-      cache["client_ip_dirty"] = False
+      cache["ip_dirty"] = False
       return
 
-   for path in IP_INFO.iterdir():
+   for path in clients_conf.iterdir():
       if not path.is_file():
          continue
 
       with path.open() as f:
          for line in f:
             if line.startswith("ifconfig-push"):
-               vpn_ip = line.split()[1]
-               cn = path.name
+               ip = line.split()[1]
 
-               cn_to_ip[cn] = vpn_ip
-               ip_to_cn[vpn_ip] = cn
+               cn_to_ip[path.name] = ip
+               ip_to_cn[ip] = path.name
                break
 
-   cache["client_ip_map"] = cn_to_ip
+   cache["cn_to_ip"] = cn_to_ip
    cache["ip_to_cn"] = ip_to_cn
-   cache["client_ip_dirty"] = False
+   cache["ip_dirty"] = False
 
 #----------------------------------------------------------------
 
 def load_CN_LIST(project):
    cache = get_project_cache(project)
    CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
-   cn_map = {}
+   cn_list = {}
    cn_order = []
 
    with CN_LIST.open() as f:
@@ -269,10 +268,10 @@ def load_CN_LIST(project):
             cn_order.append(None)
             continue
          flag, key, value = line.strip().split(";", 2)
-         cn_map[key] = (value, flag)
+         cn_list[key] = (value, flag)
          cn_order.append(key)
 
-   cache["cn_list"] = cn_map
+   cache["cn_list"] = cn_list
    cache["cn_order"] = cn_order
    cache["cn_file_dirty"] = False
 
@@ -283,7 +282,7 @@ def read_CN_LIST(ip):
    PROJECT = get_project(ip)
    cache = get_project_cache(PROJECT)
 
-   if cache["client_ip_dirty"]:
+   if cache["ip_dirty"]:
       load_CLIENT_CONF(PROJECT)
 
    if cache["cn_file_dirty"]:
@@ -292,7 +291,7 @@ def read_CN_LIST(ip):
    existing_clients = {}
 
    for key, (value, flag) in cache["cn_list"].items():
-      vpn_ip = cache["client_ip_map"].get(key)
+      vpn_ip = cache["cn_to_ip"].get(key)
       existing_clients[key] = (value, vpn_ip, flag)
 
    return existing_clients
@@ -485,7 +484,7 @@ def show_status(ip):
          rows.append({
             "name": value,
             "key": cn,
-            "vpn_ip": cache["client_ip_map"][cn],
+            "vpn_ip": cache["cn_to_ip"][cn],
             "real_ip": cache["active_clients"][cn]["real_ip"],
             "mb_received": cache["active_clients"][cn]["mb_received"],
             "mb_sent": cache["active_clients"][cn]["mb_sent"],
@@ -499,7 +498,7 @@ def show_status(ip):
          rows.append({
             "name": value,
             "key": cn,
-            "vpn_ip": cache["client_ip_map"][cn],
+            "vpn_ip": cache["cn_to_ip"][cn],
             "real_ip": "",
             "mb_received": "",
             "mb_sent": "",
@@ -540,7 +539,7 @@ class FileChangeHandler(FileSystemEventHandler):
       cache = get_project_cache(self.project)
 
       if "clients-conf" in path:
-         cache["client_ip_dirty"] = True
+         cache["cn_to_ip"] = True
          data_events[self.project].set()
          return
 
