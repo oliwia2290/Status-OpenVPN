@@ -67,8 +67,8 @@ def get_project_cache(project):
       return PROJECT_CACHE.setdefault(project, {
          "cn_order": [],
          "cn_list": {},
-         "active_clients": {},
-         "client_activity": {},
+         "active_cn_list": {},
+         "connection_history": {},
          "connection_state": {},
          "cn_to_ip": {},
          "ip_to_cn": {},
@@ -203,8 +203,9 @@ def load_CN_END_DATE(project):
    cn_end_date = {}
 
    if not certs_path.is_dir():
-      cache["cn_end_date"] = {}
-      cache["cn_end_date_dirty"] = False
+      with CACHE_LOCK:
+         cache["cn_end_date"] = {}
+         cache["cn_end_date_dirty"] = False
       return
 
    for path in certs_path.iterdir():
@@ -213,11 +214,19 @@ def load_CN_END_DATE(project):
       cn_date = subprocess.run(["openssl","x509","-enddate","-noout","-in",f"{path}"],check=True, text=True, capture_output=True)
       cn_date_split = cn_date.stdout.split("=", 1)[1].strip()
       cn_date_object = datetime.strptime(cn_date_split, "%b %d %H:%M:%S %Y %Z")
-      cn_date_str = cn_date_object.strftime("%d.%m.%Y")
+      cn_date_str = cn_date_object.strftime("%d.%m.%Y %H:%M")
       cn_end_date[path.stem] = cn_date_str
 
-   cache["cn_end_date"] = cn_end_date
-   cache["cn_end_date_dirty"] = False
+   with CACHE_LOCK:
+      cache["cn_end_date"] = cn_end_date
+      cache["cn_end_date_dirty"] = False
+
+#----------------------------------------------------------------
+
+def read_CN_END_DATE(project):
+   cache = get_project_cache(project)
+   if cache["cn_end_date_dirty"]:
+      load_CN_END_DATE(project)
 
 #----------------------------------------------------------------
 
@@ -305,10 +314,10 @@ def read_LAST_SEEN(ip):
    cache = get_project_cache(PROJECT)
 
    if not cache.get("last_seen_dirty", True):
-      return cache["client_activity"], cache["connection_state"]
+      return cache["connection_history"], cache["connection_state"]
 
    cache.setdefault("last_log_pos", 0)
-   cache.setdefault("client_activity", {})
+   cache.setdefault("connection_history", {})
    cache.setdefault("connection_state", {})
 
    if LOG.stat().st_size < cache["last_log_pos"]:
@@ -325,6 +334,8 @@ def read_LAST_SEEN(ip):
             if m:
                cn = m.group(1)
 
+               set_default_to_connection_history(cache, cn)
+
                cache["connection_state"][cn] = {
                   "verify_recorded": False,
                   "is_degraded": False
@@ -335,7 +346,7 @@ def read_LAST_SEEN(ip):
             if m:
                cn = m.group(1)
 
-               cache["client_activity"][cn] = {
+               cache["connection_history"][cn] = {
                   "last_seen": line[:19],
                   "is_blocked": False
                }
@@ -350,12 +361,12 @@ def read_LAST_SEEN(ip):
             if m:
                cn = m.group(1)
 
-               set_default_to_client_activity(cache, cn)
+               set_default_to_connection_history(cache, cn)
                set_default_to_connection_state(cache, cn)
 
                if not cache["connection_state"][cn]["verify_recorded"]:
-                  cache["client_activity"][cn]["is_blocked"] = True
-                  cache["client_activity"][cn]["last_seen"] = line[:19]
+                  cache["connection_history"][cn]["is_blocked"] = True
+                  cache["connection_history"][cn]["last_seen"] = line[:19]
                   cache["connection_state"][cn]["verify_recorded"] = True
 
          elif "VERIFY OK" in line:
@@ -363,8 +374,7 @@ def read_LAST_SEEN(ip):
             if m:
                cn = m.group(1)
 
-               set_default_to_connection_state(cache, cn)
-               set_default_to_client_activity(cache, cn)
+               set_default_to_connection_history(cache, cn)
 
                cache["connection_state"][cn] = {
                   "verify_recorded": False,
@@ -385,12 +395,10 @@ def read_LAST_SEEN(ip):
 
    cache["last_seen_dirty"] = False
 
-   return cache["client_activity"], cache["connection_state"]
-
 #----------------------------------------------------------------
 
-def set_default_to_client_activity(cache, cn):
-   cache["client_activity"].setdefault(cn, {
+def set_default_to_connection_history(cache, cn):
+   cache["connection_history"].setdefault(cn, {
       "last_seen": "Never",
       "is_blocked": False,
    })
@@ -406,13 +414,14 @@ def set_default_to_connection_state(cache, cn):
 def read_OPENVPN_STATUS(ip):
 
    PROJECT = get_project(ip)
+   cache = get_project_cache(PROJECT)
    STATUS = Path(f"/var/log/openvpn/current-logs/current-status-{PROJECT}.log")
 
    if not STATUS.is_file():
       raise FileNotFoundError(f"File {STATUS} not found")
 
    in_clients = False
-   active_clients = {}
+   active_cn_list = {}
 
    with STATUS.open() as f:
       for line in f:
@@ -428,25 +437,25 @@ def read_OPENVPN_STATUS(ip):
          if in_clients and line:
             parts = line.split(",")
             if len(parts) >= 5:
-               active_clients[parts[0]] = {
+               active_cn_list[parts[0]] = {
                   "real_ip": parts[1].split(":")[0],
                   "mb_received": round(int(parts[2]) / 1_000_000, 2),
                   "mb_sent": round(int(parts[3]) / 1_000_000, 2),
                   "connected_since": parts[4]
                }
 
-   return active_clients
+   cache["active_cn_list"] = active_cn_list
 
 #----------------------------------------------------------------
 
-def permission_filter(value, perms, project_parts, project_ip, client_activity, cn):
+def permission_filter(value, perms, project_parts, project_ip, last_seen, cn):
    if value.startswith("Newag_OpenVPN") and not perms[2]:
       return False
    if not value[-1].isdigit() and value.startswith(project_parts) and project_ip in value and not perms[3]:
       return False
    if (value[-1].isdigit() and value.startswith(project_parts) and not perms[4]) or (not value.startswith(project_parts) and not value.startswith("Newag_OpenVPN") and not perms[4]):
       return False
-   if value[-1].isdigit() and value.startswith(project_parts) and not client_activity.get(cn, {}).get("last_seen", False):
+   if value[-1].isdigit() and value.startswith(project_parts) and not last_seen:
       return False
    return True
 
@@ -454,58 +463,54 @@ def permission_filter(value, perms, project_parts, project_ip, client_activity, 
 
 def show_status(ip):
 
-   PROJECT = get_project(ip)
-   cache = get_project_cache(PROJECT)
+   project = get_project(ip)
+   cache = get_project_cache(project)
 
    read_CN_LIST(ip)
-   load_CN_END_DATE(PROJECT)
+   read_CN_END_DATE(project)
+   read_OPENVPN_STATUS(ip)
+   read_LAST_SEEN(ip)
 
-   cache["active_clients"] = read_OPENVPN_STATUS(ip)
-   client_activity, connection_state = read_LAST_SEEN(ip)
    project_parts, project_ip, perms = check_permissions(ip)
 
-   skip_empty = True
    rows = []
 
    for cn in cache["cn_order"]:
-      if cn is None:
-         if skip_empty:
-            rows.append({"empty": True})
-            skip_empty = False
+      if cn is not None:
+         value, flag = cache["cn_list"][cn]
+         permission_filter_result = permission_filter(value, perms, project_parts, project_ip, cache["connection_history"].get(cn, {}).get("last_seen"), cn)
+         if not permission_filter_result:
             continue
-         continue
-      value, flag = cache["cn_list"][cn]
-      permission_filter_result = permission_filter(value, perms, project_parts, project_ip, client_activity, cn)
-      if not permission_filter_result:
-         continue
-      skip_empty = True
-      if cn in cache["active_clients"]:
+      else:
+          rows.append({"empty": True})
+          continue
+      if cn in cache["active_cn_list"]:
 
          rows.append({
             "name": value,
             "key": cn,
-            "vpn_ip": cache["cn_to_ip"][cn],
-            "real_ip": cache["active_clients"][cn]["real_ip"],
-            "mb_received": cache["active_clients"][cn]["mb_received"],
-            "mb_sent": cache["active_clients"][cn]["mb_sent"],
-            "connected_since": cache["active_clients"][cn]["connected_since"],
+            "vpn_ip": cache["cn_to_ip"].get(cn),
+            "real_ip": cache["active_cn_list"].get(cn).get("real_ip"),
+            "mb_received": cache["active_cn_list"].get(cn).get("mb_received"),
+            "mb_sent": cache["active_cn_list"].get(cn).get("mb_sent"),
+            "connected_since": cache["active_cn_list"].get(cn).get("connected_since"),
             "last_seen": "",
             "is_blocked": flag == "B",
-            "is_degraded": cache["connection_state"][cn]["is_degraded"],
-            "cn_end_date": cache["cn_end_date"][cn],
+            "is_degraded": cache["connection_state"].get(cn).get("is_degraded"),
+            "cn_end_date": cache["cn_end_date"].get(cn),
          })
       else:
          rows.append({
             "name": value,
             "key": cn,
-            "vpn_ip": cache["cn_to_ip"][cn],
+            "vpn_ip": cache["cn_to_ip"].get(cn),
             "real_ip": "",
             "mb_received": "",
             "mb_sent": "",
             "connected_since": "",
-            "last_seen": client_activity.get(cn, {}).get("last_seen", "Never"),
+            "last_seen": cache["connection_history"].get(cn, {}).get("last_seen", "Never"),
             "is_blocked": flag == "B",
-            "cn_end_date": cache["cn_end_date"][cn],
+            "cn_end_date": cache["cn_end_date"].get(cn),
          })
 
    return rows, perms
@@ -555,9 +560,15 @@ class FileChangeHandler(FileSystemEventHandler):
       if "full-logs" in path:
          cache["last_seen_dirty"] = True
          data_events[self.project].set()
+         return
 
       if "permissions" in path:
          cache["permissions_dirty"] = True
+         data_events[self.project].set()
+         return
+
+      if "issued" in path:
+         cache["cn_end_date_dirty"] = True
          data_events[self.project].set()
          return
 
@@ -576,6 +587,8 @@ def start_watcher_for_project(project):
       observer = Observer()
 
       CLIENTS_CONF = Path(f"/etc/openvpn/{project}/clients-conf")
+      if not CLIENTS_CONF.is_dir():
+         raise NotADirectoryError(f"Dir {CLIENTS_CONF} not found")
 
       CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
       if not CN_LIST.is_file():
@@ -593,11 +606,16 @@ def start_watcher_for_project(project):
       if not PERM.is_file():
          raise FileNotFoundError(f"File {PERM} not found")
 
+      CERTS = Path(f"/etc/openvpn/{project}/easy-rsa/pki/issued")
+      if not CERTS.is_dir():
+         raise NotADirectoryError(f"Dir {CERTS} not found")
+
       observer.schedule(handler, CN_LIST.parent, recursive=False)
       observer.schedule(handler, OPENVPN_STATUS.parent, recursive=False)
       observer.schedule(handler, CLIENTS_CONF, recursive=False)
       observer.schedule(handler, FULL_LOGS, recursive=False)
       observer.schedule(handler, PERM, recursive=False)
+      observer.schedule(handler, CERTS, recursive=False)
 
       observer.start()
       watchers[project] = observer
