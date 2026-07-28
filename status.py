@@ -214,7 +214,7 @@ def load_CN_END_DATE(project):
       cn_date = subprocess.run(["openssl","x509","-enddate","-noout","-in",f"{path}"],check=True, text=True, capture_output=True)
       cn_date_split = cn_date.stdout.split("=", 1)[1].strip()
       cn_date_object = datetime.strptime(cn_date_split, "%b %d %H:%M:%S %Y %Z")
-      cn_date_str = cn_date_object.strftime("%d.%m.%Y %H:%M")
+      cn_date_str = cn_date_object.strftime("%Y-%m-%d %H:%M")
       cn_end_date[path.stem] = cn_date_str
 
    with CACHE_LOCK:
