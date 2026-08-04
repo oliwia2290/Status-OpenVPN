@@ -36,6 +36,7 @@ PROJECTS_LOCK = Lock()
 #----------------------------------------------------------------
 
 def load_projects():
+
    tmp = []
    with PROJECTS_FILE.open() as f:
       for line in f:
@@ -54,15 +55,17 @@ def load_projects():
 #----------------------------------------------------------------
 
 def get_project(ip):
+
    with PROJECTS_LOCK:
       for start_ip, project in PROJECT_MAP:
          if ip.startswith(start_ip):
             return project
-   raise ValueError("PROJECT variable is not set!")
+   raise ValueError("Project variable is not set!")
 
 #----------------------------------------------------------------
 
 def get_project_cache(project):
+
    with CACHE_LOCK:
       return PROJECT_CACHE.setdefault(project, {
          "cn_order": [],
@@ -86,6 +89,7 @@ def get_project_cache(project):
 #----------------------------------------------------------------
 
 def load_permissions(project):
+
    cache = get_project_cache(project)
    PERM = Path(f"/etc/openvpn/{project}/auth/auth-files/permissions.txt")
    perm_map = {}
@@ -117,46 +121,36 @@ def load_permissions(project):
 
 #----------------------------------------------------------------
 
-def check_permissions(ip):
-   PROJECT = get_project(ip)
-   project_ip = ip.split(".", 4)[1]
-   project_parts = PROJECT.split("-", 1)[0]
-   cache = get_project_cache(PROJECT)
+def read_PERMISSIONS(ip):
+
+   project = get_project(ip)
+   cache = get_project_cache(project)
 
    if cache["permissions_dirty"]:
-      load_permissions(PROJECT)
+      load_permissions(project)
 
    if cache["ip_dirty"]:
-      load_CLIENT_CONF(PROJECT)
+      load_CLIENT_CONF(project)
 
    if cache["cn_file_dirty"]:
-      load_CN_LIST(PROJECT)
-
-   cn = cache["ip_to_cn"].get(ip)
-
-   if cn is None:
-      return project_parts, project_ip, None, None, None, None, None
-
-   perms = cache["permissions"].get(cn)
-   if not perms:
-      return project_parts, project_ip, None, None, None, None, None
-
-   return (project_parts, project_ip, perms)
+      load_CN_LIST(project)
 
 #----------------------------------------------------------------
 
 def block_key(requested_keys, ip):
 
-   PROJECT = get_project(ip)
-   CN_LIST = Path(f"/etc/openvpn/{PROJECT}/auth/auth-files/allowed-cn.txt")
+   project = get_project(ip)
+   CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
+   cache = get_project_cache(project)
+   cn = cache["ip_to_cn"].get(ip)
 
    if not CN_LIST.is_file():
       raise FileNotFoundError(f"File {CN_LIST} not found")
 
    lines = []
-   _, _, perms = check_permissions(ip)
+   read_PERMISSIONS(ip)
 
-   if not perms[1]:
+   if not cache["permissions"][cn][1]:
       print("You do not have permission to use BLOCK button!")
       return
 
@@ -184,11 +178,12 @@ def block_key(requested_keys, ip):
 
 def restart(ip):
 
-   PROJECT = get_project(ip)
+   project = get_project(ip)
+   cache = get_project_cache(project)
 
-   _, _, perms = check_permissions(ip)
+   read_PERMISSIONS(ip)
 
-   if not perms[0]:
+   if not cache["permissions"][cache["ip_to_cn"].get(ip)][0]:
       print("You do not have permision to use RESET button!")
       return
 
@@ -197,6 +192,7 @@ def restart(ip):
 #----------------------------------------------------------------
 
 def load_CN_END_DATE(project):
+
    cache = get_project_cache(project)
    certs_path = Path(f"/etc/openvpn/{project}/easy-rsa/pki/issued")
 
@@ -224,6 +220,7 @@ def load_CN_END_DATE(project):
 #----------------------------------------------------------------
 
 def read_CN_END_DATE(project):
+
    cache = get_project_cache(project)
    if cache["cn_end_date_dirty"]:
       load_CN_END_DATE(project)
@@ -231,6 +228,7 @@ def read_CN_END_DATE(project):
 #----------------------------------------------------------------
 
 def load_CLIENT_CONF(project):
+
    cache = get_project_cache(project)
    clients_conf = Path(f"/etc/openvpn/{project}/clients-conf")
 
@@ -263,6 +261,7 @@ def load_CLIENT_CONF(project):
 #----------------------------------------------------------------
 
 def load_CN_LIST(project):
+
    cache = get_project_cache(project)
    CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
    cn_list = {}
@@ -288,14 +287,14 @@ def load_CN_LIST(project):
 
 def read_CN_LIST(ip):
 
-   PROJECT = get_project(ip)
-   cache = get_project_cache(PROJECT)
+   project = get_project(ip)
+   cache = get_project_cache(project)
 
    if cache["ip_dirty"]:
-      load_CLIENT_CONF(PROJECT)
+      load_CLIENT_CONF(project)
 
    if cache["cn_file_dirty"]:
-      load_CN_LIST(PROJECT)
+      load_CN_LIST(project)
 
    existing_clients = {}
 
@@ -309,9 +308,9 @@ def read_CN_LIST(ip):
 
 def read_LAST_SEEN(ip):
 
-   PROJECT = get_project(ip)
-   LOG = Path(f"/var/log/openvpn/full-logs/full-{PROJECT}.log")
-   cache = get_project_cache(PROJECT)
+   project = get_project(ip)
+   LOG = Path(f"/var/log/openvpn/full-logs/full-{project}.log")
+   cache = get_project_cache(project)
 
    if not cache.get("last_seen_dirty", True):
       return cache["connection_history"], cache["connection_state"]
@@ -413,9 +412,9 @@ def set_default_to_connection_state(cache, cn):
 
 def read_OPENVPN_STATUS(ip):
 
-   PROJECT = get_project(ip)
-   cache = get_project_cache(PROJECT)
-   STATUS = Path(f"/var/log/openvpn/current-logs/current-status-{PROJECT}.log")
+   project = get_project(ip)
+   cache = get_project_cache(project)
+   STATUS = Path(f"/var/log/openvpn/current-logs/current-status-{project}.log")
 
    if not STATUS.is_file():
       raise FileNotFoundError(f"File {STATUS} not found")
@@ -464,21 +463,22 @@ def permission_filter(value, perms, project_parts, project_ip, last_seen, cn):
 def show_status(ip):
 
    project = get_project(ip)
+   project_ip = ip.split(".", 4)[1]
+   project_parts = project.split("-", 1)[0]
    cache = get_project_cache(project)
 
    read_CN_LIST(ip)
    read_CN_END_DATE(project)
    read_OPENVPN_STATUS(ip)
    read_LAST_SEEN(ip)
-
-   project_parts, project_ip, perms = check_permissions(ip)
+   read_PERMISSIONS(ip)
 
    rows = []
 
    for cn in cache["cn_order"]:
       if cn is not None:
          value, flag = cache["cn_list"][cn]
-         permission_filter_result = permission_filter(value, perms, project_parts, project_ip, cache["connection_history"].get(cn, {}).get("last_seen"), cn)
+         permission_filter_result = permission_filter(value, cache["permissions"].get(cache["ip_to_cn"].get(ip)), project_parts, project_ip, cache["connection_history"].get(cn, {}).get("last_seen"), cn)
          if not permission_filter_result:
             continue
       else:
@@ -513,7 +513,7 @@ def show_status(ip):
             "cn_end_date": cache["cn_end_date"].get(cn),
          })
 
-   return rows, perms
+   return rows, cache["permissions"].get(cache["ip_to_cn"].get(ip))
 
 #----------------------------------------------------------------
 
@@ -588,7 +588,7 @@ def start_watcher_for_project(project):
 
       CLIENTS_CONF = Path(f"/etc/openvpn/{project}/clients-conf")
       if not CLIENTS_CONF.is_dir():
-         raise NotADirectoryError(f"Dir {CLIENTS_CONF} not found")
+         raise NotADirectoryError(f"{CLIENTS_CONF} is not a directory")
 
       CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
       if not CN_LIST.is_file():
@@ -608,7 +608,7 @@ def start_watcher_for_project(project):
 
       CERTS = Path(f"/etc/openvpn/{project}/easy-rsa/pki/issued")
       if not CERTS.is_dir():
-         raise NotADirectoryError(f"Dir {CERTS} not found")
+         raise NotADirectoryError(f"{CERTS} is not a directory")
 
       observer.schedule(handler, CN_LIST.parent, recursive=False)
       observer.schedule(handler, OPENVPN_STATUS.parent, recursive=False)
