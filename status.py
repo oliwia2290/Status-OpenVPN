@@ -35,7 +35,7 @@ PROJECTS_LOCK = Lock()
 
 #----------------------------------------------------------------
 
-def load_projects():
+def load_PROJECTS():
 
    tmp = []
    with PROJECTS_FILE.open() as f:
@@ -54,7 +54,7 @@ def load_projects():
 
 #----------------------------------------------------------------
 
-def get_project(ip):
+def get_PROJECT(ip):
 
    with PROJECTS_LOCK:
       for start_ip, project in PROJECT_MAP:
@@ -88,7 +88,7 @@ def get_project_cache(project):
 
 #----------------------------------------------------------------
 
-def load_permissions(project):
+def load_PERMISSIONS(project):
 
    cache = get_project_cache(project)
    PERM = Path(f"/etc/openvpn/{project}/auth/auth-files/permissions.txt")
@@ -123,11 +123,11 @@ def load_permissions(project):
 
 def read_PERMISSIONS(ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    cache = get_project_cache(project)
 
    if cache["permissions_dirty"]:
-      load_permissions(project)
+      load_PERMISSIONS(project)
 
    if cache["ip_dirty"]:
       load_CLIENT_CONF(project)
@@ -139,7 +139,7 @@ def read_PERMISSIONS(ip):
 
 def block_key(requested_keys, ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    CN_LIST = Path(f"/etc/openvpn/{project}/auth/auth-files/allowed-cn.txt")
    cache = get_project_cache(project)
    cn = cache["ip_to_cn"].get(ip)
@@ -178,7 +178,7 @@ def block_key(requested_keys, ip):
 
 def restart(ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    cache = get_project_cache(project)
 
    read_PERMISSIONS(ip)
@@ -287,7 +287,7 @@ def load_CN_LIST(project):
 
 def read_CN_LIST(ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    cache = get_project_cache(project)
 
    if cache["ip_dirty"]:
@@ -296,19 +296,11 @@ def read_CN_LIST(ip):
    if cache["cn_file_dirty"]:
       load_CN_LIST(project)
 
-   existing_clients = {}
-
-   for key, (value, flag) in cache["cn_list"].items():
-      vpn_ip = cache["cn_to_ip"].get(key)
-      existing_clients[key] = (value, vpn_ip, flag)
-
-   return existing_clients
-
 #----------------------------------------------------------------
 
 def read_LAST_SEEN(ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    LOG = Path(f"/var/log/openvpn/full-logs/full-{project}.log")
    cache = get_project_cache(project)
 
@@ -412,7 +404,7 @@ def set_default_to_connection_state(cache, cn):
 
 def read_OPENVPN_STATUS(ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    cache = get_project_cache(project)
    STATUS = Path(f"/var/log/openvpn/current-logs/current-status-{project}.log")
 
@@ -462,7 +454,7 @@ def permission_filter(value, perms, project_parts, project_ip, last_seen, cn):
 
 def show_status(ip):
 
-   project = get_project(ip)
+   project = get_PROJECT(ip)
    project_ip = ip.split(".", 4)[1]
    project_parts = project.split("-", 1)[0]
    cache = get_project_cache(project)
@@ -520,7 +512,7 @@ def show_status(ip):
 class ProjectsFileHandler(FileSystemEventHandler):
    def on_modified(self, event):
       if event.src_path == str(PROJECTS_FILE):
-         load_projects()
+         load_PROJECTS()
 
 def start_projects_watcher():
    observer = Observer()
@@ -633,7 +625,7 @@ def log_request():
 
 @app.before_request
 def ensure_watcher():
-   project = get_project(request.remote_addr)
+   project = get_PROJECT(request.remote_addr)
    start_watcher_for_project(project)
 
 @app.route("/", methods=["GET"])
@@ -643,7 +635,7 @@ def index():
 @app.route("/block", methods=["POST"])
 def block():
     block_key(request.get_json()["keys"], request.remote_addr)
-    data_events[get_project(request.remote_addr)].set()
+    data_events[get_PROJECT(request.remote_addr)].set()
     return "", 204
 
 @app.route("/restart", methods=["POST"])
@@ -655,7 +647,7 @@ def restart_openvpn():
 def events():
 
     ip = request.remote_addr
-    project = get_project(ip)
+    project = get_PROJECT(ip)
     event = data_events[project]
 
     def stream():
@@ -685,6 +677,6 @@ def stop_watchers():
       observer.join()
 
 if __name__ == "__main__":
-   load_projects()
+   load_PROJECTS()
    projects_observer = start_projects_watcher()
    serve(app, host="0.0.0.0", port=58081, threads=24)
