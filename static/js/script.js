@@ -34,6 +34,27 @@ evt.onmessage = ({ data }) => {
        </tr>`;
     }
 
+    const last_ftp_date = new Date(r.last_ftp_data);
+    const cn_now = new Date();
+    const ftp_now = new Date();
+
+    let old = false;
+
+    if (r.last_seen) {
+       const last_seen_date = new Date(r.last_seen);
+       last_seen_date.setDate(last_seen_date.getDate()-1);
+
+       old = last_ftp_date <= last_seen_date;
+    } else {
+       ftp_now.setDate(ftp_now.getDate()-1);
+
+       old = last_ftp_date <= ftp_now;
+    }
+
+    const cn_end_date = new Date(r.cn_end_date);
+    cn_end_date.setDate(cn_end_date.getDate()-7);
+    const short_life = cn_now >= cn_end_date
+
     return `
     <tr class="${r.is_degraded ? 'is_degraded' : (r.real_ip ? 'active' : 'inactive')}">
       <td></td>
@@ -47,7 +68,8 @@ evt.onmessage = ({ data }) => {
       <td>${r.mb_sent}</td>
       <td>${r.connected_since}</td>
       <td>${r.last_seen}</td>
-      <td>${r.cn_end_date}</td>
+      <td class="${short_life ? 'short_life_color' : ''}">${r.cn_end_date}</td>
+      <td class="${old ? 'last_ftp_data_color' : ''}">${r.last_ftp_data}</td>
       <td class='status-color'>${r.is_blocked ? (r.real_ip ? 'RESTART INSTANCE TO BLOCK NOW' : 'BLOCKED') : ''}</td>
     </tr>`;
   }).join("");

@@ -78,7 +78,8 @@ th:nth-child(6), td:nth-child(6) { width: 30px; }
 th:nth-child(7), td:nth-child(7) { width: 50px; }
 th:nth-child(8), td:nth-child(8) { width: 50px; }
 th:nth-child(9), td:nth-child(9) { width: 50px; }
-th:nth-child(10), td:nth-child(10) { width: 70px; }
+th:nth-child(10), td:nth-child(10) { width: 50px; }
+th:nth-child(11), td:nth-child(11) { width: 70px; }
 
 td {
   background-color: var(--bg-color);
@@ -233,6 +234,15 @@ tr.empty-row td:first-child::before {
 tr.empty-row td {
   height: 3px;
 }
+
+.last_ftp_data_color {
+  color: red;
+}
+
+.short_life_color {
+  color: red;
+}
+
 </style>
 </head>
 <body>
@@ -252,6 +262,7 @@ tr.empty-row td {
         <th>Connected Since</th>
         <th>Last Seen</th>
         <th>End Date</th>
+        <th>Last FTP Data</th>
         <th>Status</th>
       </tr>
     </thead>

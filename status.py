@@ -10,9 +10,13 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request, Response
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from pprint import pprint
 from datetime import datetime
+from difflib import get_close_matches
+
+RED = "\033[91m"
+RESET = "\033[0m"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -40,11 +44,10 @@ def load_PROJECTS():
    tmp = []
    with PROJECTS_FILE.open() as f:
       for line in f:
-         line = line.strip()
          if not line or line.startswith("#"):
             continue
-         start_ip, project = line.split(";", 1)
-         tmp.append((start_ip, project))
+         line = line.strip().split(";", 2)
+         tmp.append((line[0], line[1]))
 
    tmp.sort(key=lambda x: len(x[0]), reverse=True)
 
@@ -64,10 +67,74 @@ def get_PROJECT(ip):
 
 #----------------------------------------------------------------
 
+def load_FTP_PATH(project):
+
+   cache = get_project_cache(project)
+   ftp_paths = {}
+
+   with PROJECTS_FILE.open() as f:
+      for line in f:
+         line = line.strip().split(";", 2)
+         if line[1].startswith(project) and len(line) == 3:
+            ftp_paths[project] = line[2]
+
+   cache["ftp_path"] = ftp_paths
+   cache["ftp_path_dirty"] = False
+
+#----------------------------------------------------------------
+
+def read_FTP_PATH(project):
+
+   cache = get_project_cache(project)
+
+   if cache["ftp_path_dirty"]:
+      load_FTP_PATH(project)
+      return
+
+#----------------------------------------------------------------
+
+def update_FTP_DATA(project):
+
+   cache = get_project_cache(project)
+   read_FTP_PATH(project)
+   wait_process = subprocess.Popen(["ssh", "root@server-ftp", f'inotifywait -m -r -e create,modify,delete,move /ftp/{cache["ftp_path"][project]}'], stdout=subprocess.PIPE, text=True)
+
+   for line in wait_process.stdout:
+      load_FTP_DATA(project)
+
+#----------------------------------------------------------------
+
+def read_FTP_DATA(project):
+
+   cache = get_project_cache(project)
+
+   if cache["ftp_files_dirty"]:
+      load_FTP_DATA(project)
+
+#----------------------------------------------------------------
+
+def load_FTP_DATA(project):
+
+   cache = get_project_cache(project)
+   ftp_vehicle_info = {}
+
+   ftp_process = subprocess.run(["ssh", "root@server-ftp", f'for dir in $(find /ftp/{cache["ftp_path"][project]} -type d -name "36WEh*"); do find "$dir" -mindepth 2 -maxdepth 2 -name "*.tel" | sort | tail -1; done'], capture_output=True, text=True, check=True)
+   for path in ftp_process.stdout.strip().splitlines():
+      cn_date_object = datetime.strptime(path.split("/")[6], "%Y%m%d")
+      cn_date_str = cn_date_object.strftime("%Y-%m-%d")
+      ftp_vehicle_info[path.split("/")[5]] = cn_date_str
+
+   cache["ftp_files"] = ftp_vehicle_info
+   cache["ftp_files_dirty"] = False
+
+#----------------------------------------------------------------
+
 def get_project_cache(project):
 
    with CACHE_LOCK:
       return PROJECT_CACHE.setdefault(project, {
+         "ftp_path": {},
+         "ftp_files": {},
          "cn_order": [],
          "cn_list": {},
          "active_cn_list": {},
@@ -84,6 +151,8 @@ def get_project_cache(project):
          "cn_file_dirty": True,
          "permissions_dirty": True,
          "cn_end_date_dirty": True,
+         "ftp_path_dirty": True,
+         "ftp_files_dirty": True,
       })
 
 #----------------------------------------------------------------
@@ -163,7 +232,7 @@ def block_key(requested_keys, ip):
          parts = line.split(";", 2)
          if len(parts) == 3:
             flag, key, _ = parts
-            if key in requested_keys:
+            if key in requested_keys and key != cn:
                if flag == "B":
                   flag = "U"
                else:
@@ -439,8 +508,8 @@ def read_OPENVPN_STATUS(ip):
 
 #----------------------------------------------------------------
 
-def permission_filter(value, perms, project_parts, project_ip, last_seen, cn):
-   if value.startswith("Newag_OpenVPN") and not perms[2]:
+def permission_filter(value, perms, project_parts, project_ip, last_seen, cn, request_cn):
+   if value.startswith("Newag_OpenVPN") and not perms[2] and cn != request_cn:
       return False
    if not value[-1].isdigit() and value.startswith(project_parts) and project_ip in value and not perms[3]:
       return False
@@ -459,6 +528,8 @@ def show_status(ip):
    project_parts = project.split("-", 1)[0]
    cache = get_project_cache(project)
 
+   read_FTP_PATH(project)
+   read_FTP_DATA(project)
    read_CN_LIST(ip)
    read_CN_END_DATE(project)
    read_OPENVPN_STATUS(ip)
@@ -466,11 +537,20 @@ def show_status(ip):
    read_PERMISSIONS(ip)
 
    rows = []
+   ftp_data = {}
 
    for cn in cache["cn_order"]:
       if cn is not None:
          value, flag = cache["cn_list"][cn]
-         permission_filter_result = permission_filter(value, cache["permissions"].get(cache["ip_to_cn"].get(ip)), project_parts, project_ip, cache["connection_history"].get(cn, {}).get("last_seen"), cn)
+
+         separator = "_" if "_" in value else "-"
+
+         if "WEh" in value and value.split(separator)[1].isdigit():
+            for key, date in cache["ftp_files"].items():
+               if value.split(separator)[1] in key and "WEh" in key:
+                  ftp_data[cn] = date
+
+         permission_filter_result = permission_filter(value, cache["permissions"].get(cache["ip_to_cn"].get(ip)), project_parts, project_ip, cache["connection_history"].get(cn, {}).get("last_seen"), cn, cache["ip_to_cn"].get(ip))
          if not permission_filter_result:
             continue
       else:
@@ -490,6 +570,7 @@ def show_status(ip):
             "is_blocked": flag == "B",
             "is_degraded": cache["connection_state"].get(cn).get("is_degraded"),
             "cn_end_date": cache["cn_end_date"].get(cn),
+            "last_ftp_data": ftp_data.get(cn, "")
          })
       else:
          rows.append({
@@ -503,6 +584,7 @@ def show_status(ip):
             "last_seen": cache["connection_history"].get(cn, {}).get("last_seen", "Never"),
             "is_blocked": flag == "B",
             "cn_end_date": cache["cn_end_date"].get(cn),
+            "last_ftp_data": ftp_data.get(cn, "")
          })
 
    return rows, cache["permissions"].get(cache["ip_to_cn"].get(ip))
@@ -564,6 +646,10 @@ class FileChangeHandler(FileSystemEventHandler):
          data_events[self.project].set()
          return
 
+      if "projects" in path:
+         cache["ftp_path_dirty"] = True
+         data_events[self.project].set()
+
    def on_created(self, event):
       self.on_modified(event)
 
@@ -602,15 +688,25 @@ def start_watcher_for_project(project):
       if not CERTS.is_dir():
          raise NotADirectoryError(f"{CERTS} is not a directory")
 
+      if not PROJECTS_FILE.is_file():
+         raise FileNotFoundError(f"File {PROJECTS_FILE} not found")
+
+      FTP = subprocess.run(["ssh", "root@server-ftp", "test", "-d", "/ftp"])
+      if not FTP.returncode == 0:
+         raise NotADirectoryError("/ftp is not a directory")
+
       observer.schedule(handler, CN_LIST.parent, recursive=False)
       observer.schedule(handler, OPENVPN_STATUS.parent, recursive=False)
       observer.schedule(handler, CLIENTS_CONF, recursive=False)
       observer.schedule(handler, FULL_LOGS, recursive=False)
       observer.schedule(handler, PERM, recursive=False)
       observer.schedule(handler, CERTS, recursive=False)
+      observer.schedule(handler, PROJECTS_FILE, recursive=False)
 
       observer.start()
       watchers[project] = observer
+
+      Thread(target=update_FTP_DATA, args=(project,), daemon=True).start()
 
 #----------------------------------------------------------------
 
