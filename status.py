@@ -775,4 +775,4 @@ def stop_watchers():
 if __name__ == "__main__":
    load_PROJECTS()
    projects_observer = start_projects_watcher()
-   serve(app, host="0.0.0.0", port=58081, threads=24)
+   serve(app, host="0.0.0.0", port=58080, threads=24)
