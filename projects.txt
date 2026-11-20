@@ -12,3 +12,4 @@
 10.150.;service-newag-50150
 10.107.;op-newag-50107
 172.21.;pkpic-ezt-newag-50021
+10.170.;newag-connect-50170

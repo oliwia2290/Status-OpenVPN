@@ -13,7 +13,6 @@ from watchdog.events import FileSystemEventHandler
 from threading import Event, Lock, Thread
 from pprint import pprint
 from datetime import datetime
-from difflib import get_close_matches
 
 RED = "\033[91m"
 RESET = "\033[0m"
@@ -97,10 +96,12 @@ def update_FTP_DATA(project):
 
    cache = get_project_cache(project)
    read_FTP_PATH(project)
-   wait_process = subprocess.Popen(["ssh", "root@server-ftp", f'inotifywait -m -r -e create,modify,delete,move /ftp/{cache["ftp_path"][project]}'], stdout=subprocess.PIPE, text=True)
+   ftp_path = cache.get("ftp_path", {}).get(project)
+   if ftp_path:
+      wait_process = subprocess.Popen(["ssh", "root@server-ftp", f'inotifywait -m -r -e create,modify,delete,move /ftp/{cache["ftp_path"][project]}'], stdout=subprocess.PIPE, text=True)
 
-   for line in wait_process.stdout:
-      load_FTP_DATA(project)
+      for line in wait_process.stdout:
+         load_FTP_DATA(project)
 
 #----------------------------------------------------------------
 
@@ -117,12 +118,14 @@ def load_FTP_DATA(project):
 
    cache = get_project_cache(project)
    ftp_vehicle_info = {}
+   ftp_path = cache.get("ftp_path", {}).get(project)
 
-   ftp_process = subprocess.run(["ssh", "root@server-ftp", f'for dir in $(find /ftp/{cache["ftp_path"][project]} -type d -name "36WEh*"); do find "$dir" -mindepth 2 -maxdepth 2 -name "*.tel" | sort | tail -1; done'], capture_output=True, text=True, check=True)
-   for path in ftp_process.stdout.strip().splitlines():
-      cn_date_object = datetime.strptime(path.split("/")[6], "%Y%m%d")
-      cn_date_str = cn_date_object.strftime("%Y-%m-%d")
-      ftp_vehicle_info[path.split("/")[5]] = cn_date_str
+   if ftp_path:
+      ftp_process = subprocess.run(["ssh", "root@server-ftp", f'for dir in $(find /ftp/{cache["ftp_path"][project]} -type d -name "36WEh*"); do find "$dir" -mindepth 2 -maxdepth 2 -name "*.tel" | sort | tail -1; done'], capture_output=True, text=True, check=True)
+      for path in ftp_process.stdout.strip().splitlines():
+         cn_date_object = datetime.strptime(path.split("/")[6], "%Y%m%d")
+         cn_date_str = cn_date_object.strftime("%Y-%m-%d")
+         ftp_vehicle_info[path.split("/")[5]] = cn_date_str
 
    cache["ftp_files"] = ftp_vehicle_info
    cache["ftp_files_dirty"] = False
@@ -216,6 +219,8 @@ def block_key(requested_keys, ip):
    if not CN_LIST.is_file():
       raise FileNotFoundError(f"File {CN_LIST} not found")
 
+   active_meters = {}
+   new_meter = None
    lines = []
    read_PERMISSIONS(ip)
 
@@ -256,7 +261,7 @@ def restart(ip):
       print("You do not have permision to use RESET button!")
       return
 
-   subprocess.run(["systemctl", "restart", f"openvpn@{PROJECT}"], check=True)
+   subprocess.run(["systemctl", "restart", f"openvpn@{project}"], check=True)
 
 #----------------------------------------------------------------
 
@@ -561,7 +566,7 @@ def show_status(ip):
          rows.append({
             "name": value,
             "key": cn,
-            "vpn_ip": cache["cn_to_ip"].get(cn),
+            "vpn_ip": cache["cn_to_ip"].get(cn, {}),
             "real_ip": cache["active_cn_list"].get(cn).get("real_ip"),
             "mb_received": cache["active_cn_list"].get(cn).get("mb_received"),
             "mb_sent": cache["active_cn_list"].get(cn).get("mb_sent"),
@@ -576,7 +581,7 @@ def show_status(ip):
          rows.append({
             "name": value,
             "key": cn,
-            "vpn_ip": cache["cn_to_ip"].get(cn),
+            "vpn_ip": cache["cn_to_ip"].get(cn, {}),
             "real_ip": "",
             "mb_received": "",
             "mb_sent": "",
