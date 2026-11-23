@@ -623,7 +623,7 @@ class FileChangeHandler(FileSystemEventHandler):
       cache = get_project_cache(self.project)
 
       if "clients-conf" in path:
-         cache["cn_to_ip"] = True
+         cache["ip_dirty"] = True
          data_events[self.project].set()
          return
 
